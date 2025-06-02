@@ -8,6 +8,8 @@
 #include <JPEGDecoder.h>
 #include <JPEGENC.h>
 #include <DNSServer.h>
+#include <ESP32Servo.h>
+
 
 const byte DNS_PORT = 53;
 DNSServer dnsServer;
@@ -15,8 +17,13 @@ DNSServer dnsServer;
 // Піни
 #define LED_FLASH 4
 #define LED_BUILDIN 33
-const int stepper_h_enabled_pin = 15;
-const int stepper_d_enabled_pin = 14;
+
+Servo myservo_horizontal;
+Servo myservo_vertical; 
+
+int servoPin_horizontal = 13;
+int servoPin_vertical = 14;
+
 
 // WiFi дані для доступу
 #define WiFi_SSID "HiddenCameraDetector_Access" // SSID for the access point
@@ -41,52 +48,21 @@ IPAddress local_IP(192, 168, 4, 1); // статична айпі адреса
 IPAddress gateway(192, 168, 4, 1);
 IPAddress subnet(255, 255, 255, 0);
 
-// Створення двигунів
-AccelStepper stepper_h(AccelStepper::DRIVER, 13, 12);
-AccelStepper stepper_d(AccelStepper::DRIVER, 0, 2);
-
-// Обмеження руху
-const int H_MIN = 0;
-const int H_MAX = 100;       // ~180°
-const int H_CENTER = 50;     // ~90°
-const int H_STEP = 25;       // ~45°
-
-const int D_FRONT_MIN = -8;  // ~-15°
-const int D_FRONT_MAX = 25;  // ~45°
-const int D_REAR_MIN = 75;   // ~135°
-const int D_REAR_MAX = 108;  // ~195°
-const int D_STEP = 8;        // ~15°
-
 bool initialized = false;
 bool scanning_down = true;
 bool rear_scanning = false;
 uint scanning_progress = 0;
 
-int current_h = H_MAX;
-int current_d = D_FRONT_MAX;
+int horizontalPos = 0;
+int verticalPos = 0;
+
+int horizontalPositions[] = {0, 65, 130, 180}; // Позиції по горизонталі
+int verticalPositions[] = {0, 30};          // Позиції по вертикалі (нижня і верхня частина)
+int verticalPositions_rear[] = {170, 220}; 
 
 bool scan_in_progress = false;
 
 camera_config_t config;
-
-// Ввімкнення/вимкнення драйверів
-void enable_stepper_h() 
-{ 
-  digitalWrite(stepper_h_enabled_pin, LOW); 
-}
-void disable_stepper_h() 
-{
- digitalWrite(stepper_h_enabled_pin, HIGH); 
-}
-void enable_stepper_d() 
-{ 
-  digitalWrite(stepper_d_enabled_pin, LOW); 
-}
-void disable_stepper_d() 
-{ 
-  digitalWrite(stepper_d_enabled_pin, HIGH); 
-}
-
 
 // Спалах
 void turnOnFlashing() 
@@ -97,13 +73,6 @@ void turnOnFlashing()
 void turnOffFlashing()
 {
   digitalWrite(LED_FLASH, LOW);
-}
-
-// Рух двигуна з автоматичним увімкненням
-void moveStepper(AccelStepper &stepper, int position, int enable_pin) 
-{
-  digitalWrite(enable_pin, LOW);
-  stepper.moveTo(position);
 }
 
 void initCamera() 
@@ -142,35 +111,6 @@ void initCamera()
   }
 
   Serial.println("Camera init success");
-}
-
-bool capturePhotoSaveSpiffs() 
-{
-  turnOnFlashing();
-  delay(200);
-  camera_fb_t * fb = esp_camera_fb_get();
-  delay(100);
-  turnOffFlashing();
-  if (!fb) 
-  {
-    Serial.println("Camera capture failed");
-    return false;
-  }
-
-  File file = SPIFFS.open("/last.jpg", FILE_WRITE);
-  if (!file) 
-  {
-    Serial.println("Failed to open file in writing mode");
-    esp_camera_fb_return(fb);
-    return false;
-  }
-
-  file.write(fb->buf, fb->len);
-  file.close();
-  esp_camera_fb_return(fb);
-
-  Serial.println("Photo saved to /last.jpg");
-  return true;
 }
 
 // Функція конвертації RGB565 формату в JPEG
@@ -521,21 +461,20 @@ void photoHandler()
 void setup() {
   Serial.begin(115200);
 
-  stepper_h.setMaxSpeed(100.0);
-  stepper_h.setAcceleration(50.0);
-
-  stepper_d.setMaxSpeed(50.0);
-  stepper_d.setAcceleration(50.0);
+  // new section servo
+  ESP32PWM::allocateTimer(0);
+	ESP32PWM::allocateTimer(1);
+	ESP32PWM::allocateTimer(2);
+	ESP32PWM::allocateTimer(3);
+	myservo_horizontal.setPeriodHertz(50);    // standard 50 hz servo
+	myservo_horizontal.attach(servoPin_horizontal, 500, 2400); // attaches the servo on pin 18 to the servo object
+  myservo_vertical.setPeriodHertz(50);    // standard 50 hz servo
+	myservo_vertical.attach(servoPin_vertical, 500, 2400); // attaches the servo on pin 18 to the servo object
 
   pinMode(LED_FLASH, OUTPUT);
   digitalWrite(LED_FLASH, LOW);
   pinMode(LED_BUILDIN, OUTPUT);
   digitalWrite(LED_BUILDIN, HIGH);
-
-  pinMode(stepper_h_enabled_pin, OUTPUT);
-  disable_stepper_h();
-  pinMode(stepper_d_enabled_pin, OUTPUT);
-  disable_stepper_d();
 
   Serial.println("Stepper drivers initialized.");
   //Flashing(10);
@@ -562,6 +501,14 @@ void setup() {
 
   while (WiFi.softAPgetStationNum() == 0) 
   {
+    static unsigned long lastBlink = 0;
+    unsigned long currentMillis = millis();
+    
+    if (currentMillis - lastBlink > 300) { // Швидше блимаємо для привертання уваги
+      lastBlink = currentMillis;
+      digitalWrite(LED_BUILDIN, !digitalRead(LED_BUILDIN));
+    }
+    
     delay(500);
     Serial.print(".");
   }
@@ -641,6 +588,10 @@ void setup() {
   webserver.on("/stop-scanning", HTTP_GET, []()
   {
     scan_in_progress = false;
+    rear_scanning = false;
+    initialized = false;
+    isFlashDetected = false;
+    scanning_progress = 0;
     webserver.send(200, "text/plain", "Сканування зупинено");
     Serial.println("Сканування зупинено через запит користувача.");
   });
@@ -656,8 +607,8 @@ void setup() {
 
 void loop() 
 {
-  dnsServer.processNextRequest();
   webserver.handleClient();
+  //dnsServer.processNextRequest();
 
   if (!scan_in_progress) 
   {
@@ -685,20 +636,8 @@ void loop()
   if (!initialized) 
   {
     Serial.println("Ініціалізація: рухаюсь до початкових позицій...");
-    moveStepper(stepper_h, H_MAX, stepper_h_enabled_pin);
-    moveStepper(stepper_d, D_FRONT_MAX, stepper_d_enabled_pin);
-
-    while (stepper_h.distanceToGo() != 0 || stepper_d.distanceToGo() != 0) 
-    {
-      stepper_h.run();
-      stepper_d.run();
-    }
-
-    disable_stepper_h();
-    disable_stepper_d();
-
-    current_h = H_MAX;
-    current_d = D_FRONT_MAX;
+    myservo_horizontal.write(90);
+    myservo_vertical.write(90);
     initialized = true;
     Serial.println("Ініціалізацію завершено.");
     
@@ -708,77 +647,76 @@ void loop()
     return;
   }
 
-  stepper_h.run();
-  stepper_d.run();
 
-  if (stepper_h.distanceToGo() == 0 && stepper_d.distanceToGo() == 0) 
-  {
-    disable_stepper_h();
-    disable_stepper_d();
+  if(scanning_down && !rear_scanning){
+    if(horizontalPos == 4){
+      rear_scanning = true;
+      Serial.println("REAR SCANNING STARTED...");
+      delay(1000);
+      return;
+    }
+    if(verticalPos == 0){
+      myservo_horizontal.write(horizontalPositions[horizontalPos]);
+      horizontalPos += 1;
+      Serial.print("Позиція досягла: HORIZONTAL=");
+      Serial.print(horizontalPositions[horizontalPos]);
+      delay(500); // Час на стабілізацію серво
+    }
+    if(verticalPos < 2){
+      myservo_vertical.write(verticalPositions[verticalPos]);
+      verticalPos += 1;
+      Serial.print(" VERTICAL=");
+      Serial.println(verticalPositions[verticalPos]);
+      delay(500); // Час на стабілізацію серво
+      photoHandler();
+      delay(500);
+      scanning_progress += 8;
+    }
+    else{
+      verticalPos = 0;
+    }
+  }
+  else{
+    if(horizontalPos == -1){
+      return;
+    }
+    if(verticalPos == 0){
+      myservo_horizontal.write(horizontalPositions[horizontalPos]);
+      horizontalPos -= 1;
+      Serial.print("Позиція досягла: HORIZONTAL=");
+      Serial.print(horizontalPositions[horizontalPos]);
+      delay(500); // Час на стабілізацію серво
+    }
+    if(verticalPos < 2){
+      myservo_vertical.write(verticalPositions_rear[verticalPos]);
+      verticalPos += 1;
+      Serial.print(" VERTICAL=");
+      Serial.println(verticalPositions[verticalPos]);
+      delay(500); // Час на стабілізацію серво
+      photoHandler();
+      delay(500);
+      scanning_progress += 8;
+    }
+    else{
+      verticalPos = 0;
+    }
+  }
 
-    Serial.print("Позиція досягла: H=");
-    Serial.print(current_h);
-    Serial.print(" D=");
-    Serial.println(current_d);
-
-    Serial.println("Фотографування фото...");
-    photoHandler();
-    scanning_progress += 1;
-    delay(400); // Зменшуємо затримку для пришвидшення сканування
-    
-    // Додаємо очищення пам'яті після кожної фотографії
-    if (scanning_progress % 5 == 0) 
+  if (scanning_progress % 5 == 0) 
     { // Кожні 5 фото
       Serial.print("Проміжне очищення пам'яті. Доступно: ");
       Serial.println(ESP.getFreeHeap());
     }
 
-    if (scanning_down) 
-    {
-      current_d -= D_STEP;
-      if ((rear_scanning && current_d < D_REAR_MIN) || (!rear_scanning && current_d < D_FRONT_MIN)) 
-      {
-        // Коли досягли нижньої межі, повертаємося на початкову позицію
-        current_d = rear_scanning ? D_REAR_MAX : D_FRONT_MAX;
-        moveStepper(stepper_d, current_d, stepper_d_enabled_pin);
-        
-        // Змінюємо горизонтальну позицію
-        current_h -= H_STEP;
-        if (current_h < H_MIN) 
-        {
-          if (!rear_scanning) 
-          {
-            Serial.println("Перемикання на заднє сканування...");
-            rear_scanning = true;
-            current_h = H_MAX;
-            current_d = D_REAR_MAX;
-          } 
-          else 
-          {
-            Serial.println("СКАНУВАННЯ ЗАВЕРШЕНО. Повертання на стартову позицію...");
-            moveStepper(stepper_h, H_CENTER, stepper_h_enabled_pin);
-            moveStepper(stepper_d, D_FRONT_MAX, stepper_d_enabled_pin);
-            while (stepper_h.isRunning() || stepper_d.isRunning()) 
-            {
-              stepper_h.run();
-              stepper_d.run();
-            }
-            disable_stepper_h();
-            disable_stepper_d();
+  delay(1000);
 
-            // Скидаємо все
-            scan_in_progress = false;
-            rear_scanning = false;
-            initialized = false;
-            scanning_progress = 0;
-            Serial.println("ЗАВЕРШЕНО! Очікування на дії користувача...");
-            return;
-          }
-        }
-        moveStepper(stepper_h, current_h, stepper_h_enabled_pin);
-      }
-    }
-
-    moveStepper(stepper_d, current_d, stepper_d_enabled_pin);
+  if(horizontalPos == -1 && rear_scanning){
+    scan_in_progress = false;
+    rear_scanning = false;
+    initialized = false;
+    scanning_progress = 0;
+    Serial.println("ЗАВЕРШЕНО! Очікування на дії користувача...");
+    return;
   }
+  
 }
